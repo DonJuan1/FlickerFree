@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#111111" />
+    <title>FlickerFree Probe</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <h1>Camera probe</h1>
+      <p id="env" class="muted"></p>
+
+      <section class="row">
+        <select id="camera" aria-label="Camera"></select>
+        <select id="resolution" aria-label="Resolution">
+          <option value="640x480">640x480</option>
+          <option value="1280x720" selected>1280x720</option>
+          <option value="1920x1080">1920x1080</option>
+        </select>
+        <button id="start">Start camera</button>
+      </section>
+
+      <section class="viewer">
+        <video id="video" playsinline muted autoplay></video>
+        <canvas id="plot" width="640" height="200"></canvas>
+        <p class="muted small">Plot: brightness along the image's vertical axis (orange) and horizontal axis (blue), centre region, detrended. Flicker bands show up as a regular wave on one of them.</p>
+      </section>
+
+      <section>
+        <h2>Live</h2>
+        <dl id="live" class="stats"></dl>
+      </section>
+
+      <section>
+        <h2>Controls</h2>
+        <div id="controls" class="controls"><p class="muted">Start the camera first.</p></div>
+        <div class="row">
+          <button id="refreshCaps" disabled>Re-read capabilities</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Exposure response test</h2>
+        <p class="muted small">Steps through the exposure range in manual mode and measures how each step changes the image. Point the camera at a steady, evenly lit surface (or at the flickering screen) and hold still.</p>
+        <div class="row">
+          <button id="runTest" disabled>Run test</button>
+          <span id="testStatus" class="muted"></span>
+        </div>
+        <div class="table-wrap"><table id="testTable"></table></div>
+      </section>
+
+      <section>
+        <h2>Report</h2>
+        <p class="muted small">Copy this and paste it into the chat.</p>
+        <div class="row">
+          <button id="copy">Copy report</button>
+          <button id="download">Download JSON</button>
+        </div>
+        <pre id="report"></pre>
+      </section>
+
+      <section>
+        <h2>Log</h2>
+        <pre id="log"></pre>
+      </section>
+    </main>
+    <script type="module" src="./src/probe/main.ts"></script>
+  </body>
+</html>
