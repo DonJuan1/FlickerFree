@@ -9,11 +9,56 @@
     <link rel="stylesheet" href="./src/style.css" />
   </head>
   <body>
-    <main class="page">
+    <main class="page app">
       <h1>FlickerFree</h1>
-      <p>Finds the fastest shutter speed at which a filmed screen shows no flicker bands.</p>
-      <p>The measuring app is not built yet. Step 1 is the camera probe, which reports what exposure control Chrome gives on this phone.</p>
-      <p><a class="button" href="./probe.html">Open camera probe</a></p>
+
+      <div id="stage" class="stage">
+        <video id="video" playsinline muted autoplay></video>
+        <div id="region" class="region" hidden></div>
+        <p id="cameraMsg" class="stage-msg">Starting camera...</p>
+      </div>
+      <p class="muted small">Fill the outlined area with the screen and hold the phone steady while measuring.</p>
+
+      <div class="row">
+        <label class="fps">
+          <span>Project fps</span>
+          <select id="fps">
+            <option value="23.976">23.976</option>
+            <option value="24">24</option>
+            <option value="25" selected>25</option>
+            <option value="29.97">29.97</option>
+            <option value="30">30</option>
+            <option value="48">48</option>
+            <option value="50">50</option>
+            <option value="59.94">59.94</option>
+            <option value="60">60</option>
+          </select>
+        </label>
+        <button id="measure" class="primary" disabled>Measure</button>
+      </div>
+
+      <section id="progress" class="card" hidden>
+        <div class="bar"><div id="bar"></div></div>
+        <div class="row">
+          <span id="phase" class="muted"></span>
+          <button id="stop">Stop</button>
+        </div>
+      </section>
+
+      <section id="result" class="card" hidden></section>
+      <section id="error" class="card bad" hidden></section>
+
+      <details class="diag">
+        <summary>Diagnostics</summary>
+        <p class="muted small">After a measurement, copy the report and paste it into the chat if something looks off.</p>
+        <div class="row">
+          <button id="copyDiag">Copy report</button>
+          <button id="downloadDiag">Download full data</button>
+          <a href="./probe.html">Camera probe</a>
+        </div>
+        <pre id="diagStatus" class="small"></pre>
+      </details>
     </main>
+    <script type="module" src="./src/app/main.ts"></script>
   </body>
 </html>

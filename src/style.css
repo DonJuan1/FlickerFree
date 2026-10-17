@@ -189,3 +189,130 @@ pre {
 .bad {
   color: var(--bad);
 }
+
+/* ---------- app ---------- */
+
+.stage {
+  position: relative;
+  width: 100%;
+  max-height: 62vh;
+  aspect-ratio: 16 / 9;
+  margin: 8px auto;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.stage video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.region {
+  position: absolute;
+  border: 2px solid var(--accent);
+  border-radius: 4px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+.stage-msg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  color: var(--muted);
+}
+
+.stage-msg[hidden] {
+  display: none;
+}
+
+.fps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.primary {
+  flex: 1;
+  justify-content: center;
+  font-weight: 600;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111;
+  min-height: 52px;
+}
+
+.primary:disabled {
+  opacity: 0.35;
+}
+
+.card {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 16px;
+  margin: 12px 0;
+}
+
+.card.bad {
+  color: var(--bad);
+}
+
+.bar {
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.bar > div {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+#progress .row {
+  justify-content: space-between;
+}
+
+.speed {
+  font-size: 3rem;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+.angle {
+  font-size: 1.4rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.headline {
+  font-size: 1.6rem;
+  font-weight: 700;
+}
+
+table.values td {
+  font-size: 1rem;
+  padding: 6px 12px 6px 0;
+  text-align: left;
+}
+
+.diag {
+  margin-top: 24px;
+}
+
+.diag summary {
+  color: var(--muted);
+  cursor: pointer;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+}

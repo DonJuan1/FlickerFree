@@ -1,0 +1,611 @@
+// Pure analysis: per-step band profiles, content-free distances between exposure steps,
+// flicker-frequency fit across a sweep, clean shutter values and refinement helpers.
+// No DOM or camera dependencies.
+//
+// Physics: a rolling-shutter row integrates the screen's light over the exposure E.
+// Banding vanishes when E is a whole number of flicker periods: E = n / f. That holds
+// for any camera, so a clean value measured on the phone is clean on a cinema camera too.
+//
+// Screen content is the same at every exposure step (ISO keeps the brightness constant)
+// while the bands change, so steps are compared with each other: in log brightness the
+// content cancels in the difference between two steps. Covariance between strips removes
+// what differs between strips (sensor noise, content shifting with hand movement).
+
+/** Brightness profiles of one frame along the sensor readout axis. */
+export interface FrameSample {
+  /** One profile per strip: mean luma per readout row. All strips have equal length. */
+  strips: Float32Array[];
+  meanLuma: number;
+  /** Fraction of analysed pixels at or near full white. */
+  clipFraction: number;
+  /** Capture time in seconds (any fixed origin). */
+  time: number;
+}
+
+/** Summary of one exposure step, see stepProfile(). */
+export interface StepProfile {
+  exposure: number;
+  /** Mean over frames of the cross-strip covariance of each frame's log profiles. */
+  selfCov: number;
+  /** Per strip: mean over frames of the log profiles. */
+  mean: Float64Array[];
+  /** Capture times of the frames, seconds. */
+  times: number[];
+}
+
+export interface FlickerFit {
+  frequency: number;
+  /** Mean dip contrast (antinode - null) / antinode: 1 = perfectly clean dips, <= 0 = no evidence. */
+  confidence: number;
+  /** Predicted null exposures inside the sweep that supported the fit. */
+  anchors: number[];
+  /** RMS band strength (log brightness) halfway between nulls. */
+  amplitude: number;
+}
+
+/** Below this RMS band strength (log luma, roughly relative brightness / 2.2) flicker counts as absent. */
+export const MIN_FLICKER_AMPLITUDE = 0.0015;
+/** Minimum mean dip contrast for a frequency fit to count. */
+export const MIN_CONFIDENCE = 0.5;
+
+/** Log of a profile, minus its mean and least-squares line. */
+export function logProfile(p: ArrayLike<number>): Float64Array {
+  const n = p.length;
+  const out = new Float64Array(n);
+  if (n < 3) return out;
+  let sy = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    const v = Math.log(p[i] > 1 ? p[i] : 1);
+    out[i] = v;
+    sy += v;
+    sxy += i * v;
+  }
+  const sx = (n * (n - 1)) / 2;
+  const sxx = ((n - 1) * n * (2 * n - 1)) / 6;
+  const slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+  const intercept = (sy - slope * sx) / n;
+  for (let i = 0; i < n; i++) out[i] -= intercept + slope * i;
+  return out;
+}
+
+/** Mean over strip pairs a < b of the symmetrised dot product <x_a, y_b>, per row. */
+function crossCov(x: Float64Array[], y: Float64Array[]): number {
+  let acc = 0;
+  let pairs = 0;
+  for (let a = 0; a < x.length; a++) {
+    for (let b = a + 1; b < x.length; b++) {
+      acc += (dot(x[a], y[b]) + dot(x[b], y[a])) / 2;
+      pairs++;
+    }
+  }
+  return pairs ? acc / pairs / x[0].length : 0;
+}
+
+function dot(a: Float64Array, b: Float64Array): number {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+export function stepProfile(exposure: number, frames: FrameSample[]): StepProfile {
+  const k = frames[0]?.strips.length ?? 0;
+  const rows = frames[0]?.strips[0]?.length ?? 0;
+  const mean = Array.from({ length: k }, () => new Float64Array(rows));
+  let selfCov = 0;
+  for (const f of frames) {
+    const logs = f.strips.map(logProfile);
+    selfCov += crossCov(logs, logs);
+    logs.forEach((l, s) => {
+      for (let i = 0; i < rows; i++) mean[s][i] += l[i] / frames.length;
+    });
+  }
+  return { exposure, selfCov: frames.length ? selfCov / frames.length : 0, mean, times: frames.map((f) => f.time) };
+}
+
+/**
+ * Squared band distance between two steps, averaged over their frame pairs. Content
+ * shared by both steps cancels; rolling bands count with their full per-frame energy.
+ */
+export function profileDistance(a: StepProfile, b: StepProfile): number {
+  return a.selfCov + b.selfCov - 2 * crossCov(a.mean, b.mean);
+}
+
+/** Flicker energy of a single step on its own (content not removed). For live display. */
+export function flickerEnergy(frames: FrameSample[]): number {
+  return stepProfile(0, frames).selfCov;
+}
+
+/** All steps of a sweep with their pairwise distances, interpolated in log exposure. */
+export class SweepModel {
+  readonly steps: StepProfile[];
+  private readonly xs: number[];
+  private readonly D: Float64Array;
+  /** Gram matrix of the step means (cross-strip): G[i][j] = crossCov(mean_i, mean_j). */
+  readonly G: Float64Array;
+
+  constructor(steps: StepProfile[]) {
+    this.steps = [...steps].sort((a, b) => a.exposure - b.exposure);
+    this.xs = this.steps.map((s) => Math.log(s.exposure));
+    const n = this.steps.length;
+    this.D = new Float64Array(n * n);
+    this.G = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) {
+      for (let j = i; j < n; j++) {
+        const g = crossCov(this.steps[i].mean, this.steps[j].mean);
+        const d = this.steps[i].selfCov + this.steps[j].selfCov - 2 * g;
+        this.G[i * n + j] = this.G[j * n + i] = g;
+        this.D[i * n + j] = this.D[j * n + i] = d;
+      }
+    }
+  }
+
+  /**
+   * Band energy of a step against a content estimate given as weights over the sweep's
+   * step means (content = sum w_i mean_i), averaged over the step's frames.
+   */
+  energyVsContent(step: StepProfile, weights: Float64Array): number {
+    const n = this.steps.length;
+    let cross = 0;
+    for (let i = 0; i < n; i++) if (weights[i]) cross += weights[i] * crossCov(step.mean, this.steps[i].mean);
+    return step.selfCov + this.contentNorm(weights) - 2 * cross;
+  }
+
+  /** Band energy of sweep step i against the content estimate. */
+  stepEnergyVsContent(i: number, weights: Float64Array): number {
+    const n = this.steps.length;
+    let cross = 0;
+    for (let j = 0; j < n; j++) cross += weights[j] * this.G[i * n + j];
+    return this.steps[i].selfCov + this.contentNorm(weights) - 2 * cross;
+  }
+
+  private contentNorm(w: Float64Array): number {
+    const n = this.steps.length;
+    let s = 0;
+    for (let i = 0; i < n; i++) {
+      if (!w[i]) continue;
+      for (let j = 0; j < n; j++) s += w[i] * w[j] * this.G[i * n + j];
+    }
+    return s;
+  }
+
+  get eMin() {
+    return this.steps[0].exposure;
+  }
+
+  get eMax() {
+    return this.steps[this.steps.length - 1].exposure;
+  }
+
+  /** Median spacing between steps in log exposure. */
+  get logSpacing(): number {
+    return median(this.xs.slice(1).map((x, i) => x - this.xs[i]));
+  }
+
+  get maxDistance(): number {
+    return Math.max(...this.D);
+  }
+
+  /**
+   * Frame-to-frame variation within a step at its quietest: the low end of the steps'
+   * self-distances (median of three neighbours, so one lucky step doesn't count).
+   * Rolling bands inflate the self-distance elsewhere, but not at the nulls.
+   */
+  get selfNoise(): number {
+    const n = this.steps.length;
+    const self = this.steps.map((_, i) => this.D[i * n + i]);
+    return Math.max(0, Math.min(...self.map((_, i) => median(self.slice(Math.max(0, i - 1), i + 2)))));
+  }
+
+  /** Index i and weight t so that log e = (1 - t) xs[i] + t xs[i + 1], or null outside the sweep. */
+  private locate(e: number): { i: number; t: number } | null {
+    const x = Math.log(e);
+    const xs = this.xs;
+    if (x < xs[0] - 1e-6 || x > xs[xs.length - 1] + 1e-6) return null;
+    if (xs.length === 1) return { i: 0, t: 0 };
+    let i = 0;
+    while (i < xs.length - 2 && xs[i + 1] < x) i++;
+    return { i, t: Math.min(1, Math.max(0, (x - xs[i]) / (xs[i + 1] - xs[i]))) };
+  }
+
+  /** Distance from step j to the point between steps i and i + 1 (law of cosines). */
+  private toStep(j: number, p: { i: number; t: number }): number {
+    const n = this.steps.length;
+    const { i, t } = p;
+    if (t === 0) return this.D[i * n + j];
+    return (1 - t) * this.D[i * n + j] + t * this.D[(i + 1) * n + j] - t * (1 - t) * this.D[i * n + i + 1];
+  }
+
+  /** Squared band distance between two exposures inside the sweep (NaN outside). */
+  dist(ea: number, eb: number): number {
+    const a = this.locate(ea);
+    const b = this.locate(eb);
+    if (!a || !b) return NaN;
+    const n = this.steps.length;
+    const at = (j: number) => this.toStep(j, b);
+    if (a.t === 0) return at(a.i);
+    return (1 - a.t) * at(a.i) + a.t * at(a.i + 1) - a.t * (1 - a.t) * this.D[a.i * n + a.i + 1];
+  }
+
+  /** Spread term for centroid distances: (1 / 2N^2) * sum of pairwise distances of the anchors. */
+  private spread(anchors: number[]): number {
+    let s = 0;
+    for (const a of anchors) for (const b of anchors) s += this.dist(a, b);
+    return s / (2 * anchors.length * anchors.length);
+  }
+
+  /** Band energy at e: squared distance to the centroid of the anchors (the predicted nulls). */
+  energyAt(e: number, anchors: number[], spread = this.spread(anchors)): number {
+    let s = 0;
+    for (const a of anchors) s += this.dist(e, a);
+    return s / anchors.length - spread;
+  }
+
+  /** Band energy of a step measured separately (e.g. during refinement) against the anchors. */
+  energyOf(step: StepProfile, anchors: number[]): number {
+    const n = this.steps.length;
+    const toNew = this.steps.map((s) => profileDistance(step, s));
+    let s = 0;
+    for (const a of anchors) {
+      const p = this.locate(a);
+      if (!p) continue;
+      s += p.t === 0 ? toNew[p.i] : (1 - p.t) * toNew[p.i] + p.t * toNew[p.i + 1] - p.t * (1 - p.t) * this.D[p.i * n + p.i + 1];
+    }
+    return s / anchors.length - this.spread(anchors);
+  }
+}
+
+interface Candidate {
+  f: number;
+  score: number;
+  contrast: number;
+  anchors: number[];
+  /** Mean antinode energy. */
+  anti: number;
+  /** Null orders n (exposure n / f) that had antinodes to compare with. */
+  nulls: { n: number }[];
+}
+
+function evaluate(model: SweepModel, f: number, nMax: number, eps: number): Candidate | null {
+  const { eMin, eMax } = model;
+  const nFrom = Math.max(1, Math.ceil(f * eMin * (1 - 1e-7)));
+  const nTo = Math.min(nMax, Math.floor(f * eMax * (1 + 1e-7)));
+  if (nTo - nFrom < 1) return null; // needs at least two nulls to compare
+  const anchors: number[] = [];
+  for (let n = nFrom; n <= nTo; n++) anchors.push(n / f);
+  let spread = 0;
+  for (const a of anchors) for (const b of anchors) spread += model.dist(a, b);
+  spread /= 2 * anchors.length * anchors.length;
+  let score = 0;
+  let contrast = 0;
+  let antiSum = 0;
+  let count = 0;
+  const nulls: Candidate['nulls'] = [];
+  for (let n = nFrom; n <= nTo; n++) {
+    const antis = [(n - 0.5) / f, (n + 0.5) / f].filter((e) => e >= eMin * (1 - 1e-7) && e <= eMax * (1 + 1e-7));
+    if (!antis.length) continue;
+    const a = antis.reduce((s, e) => s + model.energyAt(e, anchors, spread), 0) / antis.length;
+    const v = model.energyAt(n / f, anchors, spread);
+    // Log depth ratio rewards deep nulls. The floor caps it at 1e5:1, or lower where camera
+    // noise sets the limit, so a single freak value can't dominate.
+    const floor = Math.max(1e-5 * Math.max(a, 0), eps);
+    score += Math.log((Math.max(a, 0) + floor) / (Math.max(v, 0) + floor));
+    contrast += (a - v) / (Math.max(a, 0) + floor);
+    antiSum += a;
+    nulls.push({ n });
+    count++;
+  }
+  if (!count || !Number.isFinite(score)) return null;
+  return { f, score, contrast: contrast / count, anchors, anti: antiSum / count, nulls };
+}
+
+/**
+ * Finds the flicker frequency f whose nulls (n / f) best explain the sweep. A candidate
+ * scores when the steps at its predicted nulls look alike (bands gone, only content left)
+ * and the steps halfway between them ((n +- 0.5) / f) look different. Log depth ratios are
+ * summed over the nulls, which rewards explaining more dips: that separates f from its
+ * sub-harmonics, while harmonics put nulls on antinodes and lose.
+ */
+export function fitFlicker(model: SweepModel): FlickerFit | null {
+  if (model.steps.length < 6) return null;
+  const { eMin, eMax } = model;
+  const dLog = model.logSpacing;
+  if (!(dLog > 0)) return null;
+  // Nulls closer together than ~4 steps (spacing in log exposure ~ 1/n) can't be resolved.
+  const nMax = Math.max(2, Math.floor(1 / (4 * dLog)));
+  // Noise level of a distance: nulls can't be resolved below it.
+  const eps = Math.max(model.selfNoise, 1e-12);
+  const fLo = 1 / eMax;
+  const fHi = nMax / eMin;
+  if (!(fHi > fLo)) return null;
+
+  const STEP = 0.0005;
+  let best: Candidate | null = null;
+  for (let lf = Math.log(fLo); lf <= Math.log(fHi); lf += STEP) {
+    const c = evaluate(model, Math.exp(lf), nMax, eps);
+    if (c && (!best || c.score > best.score)) best = c;
+  }
+  if (!best) return null;
+
+  // Two flicker sources (e.g. PWM at 240 Hz plus a 60 Hz refresh scan): the PWM dips
+  // dominate the score, but only every k-th of them is fully clean. If the nulls shared
+  // with a sub-harmonic f / k are much cleaner than the others, the sub-harmonic is the
+  // real answer, provided it fits well on its own.
+  let chosen = best;
+  let cleanest = Infinity;
+  for (let k = 2; k <= 8; k++) {
+    const shared = best.nulls.filter((x) => x.n % k === 0).map((x) => x.n / best.f);
+    const other = best.nulls.filter((x) => x.n % k !== 0).map((x) => x.n / best.f);
+    if (shared.length < 2 || !other.length) continue;
+    // Energies against the centroid of the shared nulls: if those are clean it is the content.
+    const vShared = mean(shared.map((e) => model.energyAt(e, shared)));
+    const vOther = median(other.map((e) => model.energyAt(e, shared)));
+    // Shared nulls must be clean in absolute terms, and the others must show a clearly
+    // visible residual well above that (not just grid interpolation error).
+    if (Math.sqrt(Math.max(0, vShared)) > MIN_FLICKER_AMPLITUDE) continue;
+    if (vOther < 10 * Math.max(vShared, eps) || Math.sqrt(vOther) < 2 * MIN_FLICKER_AMPLITUDE) continue;
+    if (vShared >= cleanest) continue;
+    let sub: Candidate | null = null;
+    const center = Math.log(best.f / k);
+    for (let lf = center - 0.004; lf <= center + 0.004; lf += STEP) {
+      const c = evaluate(model, Math.exp(lf), nMax, eps);
+      if (c && (!sub || c.score > sub.score)) sub = c;
+    }
+    if (sub && sub.contrast >= MIN_CONFIDENCE) {
+      chosen = sub;
+      cleanest = vShared;
+    }
+  }
+  const polished = polishAnchors(model, chosen.anchors, chosen.f);
+  return {
+    frequency: polished.f,
+    confidence: chosen.contrast,
+    anchors: polished.anchors,
+    amplitude: Math.sqrt(Math.max(0, chosen.anti)),
+  };
+}
+
+/**
+ * Moves each predicted null to where the sweep's profiles match the other nulls best
+ * (sub-step, via interpolation), then refits f = n / E by least squares. The grid search
+ * lands within a percent or two; this pulls the nulls onto the data.
+ */
+function polishAnchors(model: SweepModel, anchors: number[], f: number): { f: number; anchors: number[] } {
+  if (anchors.length < 2) return { f, anchors };
+  const orders = anchors.map((a) => Math.round(a * f));
+  const a = [...anchors];
+  for (let iter = 0; iter < 3; iter++) {
+    for (let i = 0; i < a.length; i++) {
+      const others = a.filter((_, j) => j !== i);
+      const w = Math.min(0.05, 0.25 / orders[i]);
+      let bestE = a[i];
+      let bestD = Infinity;
+      for (let k = -20; k <= 20; k++) {
+        const e = a[i] * (1 + (w * k) / 20);
+        if (e < model.eMin || e > model.eMax) continue;
+        let d = 0;
+        for (const o of others) d += model.dist(e, o);
+        if (d < bestD) {
+          bestD = d;
+          bestE = e;
+        }
+      }
+      a[i] = bestE;
+    }
+  }
+  // Least squares for a_n = n * T.
+  let num = 0;
+  let den = 0;
+  orders.forEach((n, i) => {
+    num += n * a[i];
+    den += n * n;
+  });
+  const fitted = den / num;
+  // Keep the grid result if polishing wandered off (e.g. noise-dominated nulls).
+  if (!(Math.abs(fitted / f - 1) < 0.03)) return { f, anchors };
+  return { f: fitted, anchors: a };
+}
+
+export interface ContentFit {
+  /** Flicker frequency refined by the model fit. */
+  frequency: number;
+  /** Fraction of the band variance in the step means that the model explains (0..1). */
+  explained: number;
+  /** Content estimate as weights over model.steps (content = sum w_i mean_i). */
+  weights: Float64Array;
+}
+
+/**
+ * Fits the step means with the rolling-shutter band model for bands that stand still
+ * between frames (flicker locked to a multiple of the phone's frame rate):
+ * mean_E = content + sum_k (s_k(E) P_k + c_k(E) Q_k), where the window average of
+ * e^{i 2 pi k f t} over the exposure gives s_k = sin(b) / b and c_k = (cos(b) - 1) / b,
+ * b = 2 pi k f E. Content, P_k and Q_k are unknown profiles, solved by least squares for
+ * each f near f0.
+ *
+ * In that regime comparing nulls with each other is blind to a small error in f (every
+ * null carries the same residual pattern); this fit is not, and it yields the content on
+ * its own for the refinement to measure against. Drifting or rolling bands don't fit the
+ * model (low `explained`), but there comparing nulls works.
+ */
+export function fitContent(model: SweepModel, f0: number, harmonics = 3, span = 0.03): ContentFit | null {
+  const n = model.steps.length;
+  // Very short exposures carry deep modulation where log brightness is far from linear.
+  const idx = model.steps.flatMap((s, i) => (s.exposure >= 0.6 / f0 ? [i] : []));
+  const p = 1 + 2 * harmonics;
+  if (idx.length < p + 3) return null;
+  const G = model.G;
+  const design = (f: number) =>
+    idx.map((i) => {
+      const e = model.steps[i].exposure;
+      const row = [1];
+      for (let k = 1; k <= harmonics; k++) {
+        const b = 2 * Math.PI * k * f * e;
+        row.push(Math.sin(b) / b, (Math.cos(b) - 1) / b);
+      }
+      return row;
+    });
+  // Variance captured by the constant column alone (content), for normalisation.
+  let sumG = 0;
+  let traceG = 0;
+  for (const i of idx) {
+    traceG += G[i * n + i];
+    for (const j of idx) sumG += G[i * n + j];
+  }
+  const constOnly = sumG / idx.length;
+  const total = traceG - constOnly;
+  if (!(total > 0)) return null;
+
+  let best: { f: number; explained: number; X: number[][]; Ainv: number[][] } | null = null;
+  for (let t = -span; t <= span + 1e-12; t += 0.0002) {
+    const f = f0 * Math.exp(t);
+    const X = design(f);
+    const Ainv = invert(gramOf(X));
+    if (!Ainv) continue;
+    const GX = idx.map((i) => {
+      const r = new Array(p).fill(0);
+      idx.forEach((j, jj) => {
+        const g = G[i * n + j];
+        for (let c = 0; c < p; c++) r[c] += g * X[jj][c];
+      });
+      return r;
+    });
+    // trace((X^T X)^-1 X^T G X)
+    let tr = 0;
+    for (let a = 0; a < p; a++) {
+      for (let b = 0; b < p; b++) {
+        let xgx = 0;
+        for (let r = 0; r < idx.length; r++) xgx += X[r][b] * GX[r][a];
+        tr += Ainv[a][b] * xgx;
+      }
+    }
+    const explained = (tr - constOnly) / total;
+    if (!best || explained > best.explained) best = { f, explained, X, Ainv };
+  }
+  if (!best) return null;
+  const fit = best;
+  // Content weights: first row of (X^T X)^-1 X^T.
+  const weights = new Float64Array(n);
+  idx.forEach((i, r) => {
+    let w = 0;
+    for (let c = 0; c < p; c++) w += fit.Ainv[0][c] * fit.X[r][c];
+    weights[i] = w;
+  });
+  return { frequency: fit.f, explained: fit.explained, weights };
+}
+
+function gramOf(X: number[][]): number[][] {
+  const p = X[0].length;
+  const A = Array.from({ length: p }, () => new Array(p).fill(0));
+  for (const row of X) for (let a = 0; a < p; a++) for (let b = 0; b < p; b++) A[a][b] += row[a] * row[b];
+  return A;
+}
+
+/** Gauss-Jordan inverse with partial pivoting; null if singular. */
+function invert(M: number[][]): number[][] | null {
+  const p = M.length;
+  const a = M.map((row, i) => [...row, ...Array.from({ length: p }, (_, j) => (i === j ? 1 : 0))]);
+  for (let c = 0; c < p; c++) {
+    let piv = c;
+    for (let r = c + 1; r < p; r++) if (Math.abs(a[r][c]) > Math.abs(a[piv][c])) piv = r;
+    if (Math.abs(a[piv][c]) < 1e-14) return null;
+    [a[c], a[piv]] = [a[piv], a[c]];
+    const d = a[c][c];
+    for (let k = 0; k < 2 * p; k++) a[c][k] /= d;
+    for (let r = 0; r < p; r++) {
+      if (r === c) continue;
+      const m = a[r][c];
+      if (m) for (let k = 0; k < 2 * p; k++) a[r][k] -= m * a[c][k];
+    }
+  }
+  return a.map((row) => row.slice(p));
+}
+
+export function isFlicker(fit: FlickerFit | null): fit is FlickerFit {
+  return !!fit && fit.amplitude >= MIN_FLICKER_AMPLITUDE && fit.confidence >= MIN_CONFIDENCE;
+}
+
+/** Exposure values from eMin to eMax with a constant ratio, snapped to the device step. */
+export function exposureGrid(eMin: number, eMax: number, ratio: number, step = 0): number[] {
+  const out: number[] = [];
+  for (let e = eMin; e <= eMax * (1 + 1e-9); e *= ratio) out.push(snapExposure(e, step));
+  if (out[out.length - 1] < eMax * (1 - 1e-9)) out.push(snapExposure(eMax, step));
+  return [...new Set(out)].filter((e) => e >= eMin * (1 - 1e-9) && e <= eMax * (1 + 1e-9) && e > 0);
+}
+
+export function snapExposure(e: number, step: number): number {
+  return step > 0 ? Math.max(step, Math.round(e / step) * step) : e;
+}
+
+/**
+ * All clean exposures n / f within [eMin, eMax]. A value up to 0.5% past eMax (e.g. 1/49.9
+ * at 50 fps) is kept and clamped to eMax: the residual there is negligible.
+ */
+export function cleanExposures(f: number, eMin: number, eMax: number): number[] {
+  const out: number[] = [];
+  for (let n = Math.max(1, Math.ceil(f * eMin * (1 - 1e-9))); n / f <= eMax * 1.005; n++) out.push(Math.min(n / f, eMax));
+  return out;
+}
+
+/** The value closest to target on a log scale (equal ratio either side). */
+export function closestTo(values: number[], target: number): number | undefined {
+  let best: number | undefined;
+  for (const v of values) {
+    if (best === undefined || Math.abs(Math.log(v / target)) < Math.abs(Math.log(best / target))) best = v;
+  }
+  return best;
+}
+
+/** Vertex of the least-squares parabola through the points, if it opens upwards and lies within them. */
+export function parabolaVertex(points: { x: number; y: number }[]): number | null {
+  if (points.length < 3) return null;
+  const xs = points.map((p) => p.x);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const sc = (Math.max(...xs) - Math.min(...xs)) / 2 || 1;
+  // Normal equations for y = a u^2 + b u + c with u = (x - cx) / sc.
+  let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, t0 = 0, t1 = 0, t2 = 0;
+  for (const p of points) {
+    const u = (p.x - cx) / sc;
+    const u2 = u * u;
+    s0 += 1;
+    s1 += u;
+    s2 += u2;
+    s3 += u2 * u;
+    s4 += u2 * u2;
+    t0 += p.y;
+    t1 += p.y * u;
+    t2 += p.y * u2;
+  }
+  const det = (m: number[][]) =>
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+    m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+    m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  const D = det([
+    [s4, s3, s2],
+    [s3, s2, s1],
+    [s2, s1, s0],
+  ]);
+  if (Math.abs(D) < 1e-12) return null;
+  const a = det([[t2, s3, s2], [t1, s2, s1], [t0, s1, s0]]) / D;
+  const b = det([[s4, t2, s2], [s3, t1, s1], [s2, t0, s0]]) / D;
+  if (!(a > 0)) return null;
+  const u = -b / (2 * a);
+  if (u < -1 || u > 1) return null;
+  return cx + u * sc;
+}
+
+/** Shutter angle in degrees for an exposure at a frame rate. */
+export function shutterAngle(exposure: number, fps: number): number {
+  return 360 * fps * exposure;
+}
+
+function mean(a: number[]): number {
+  return a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN;
+}
+
+function median(a: number[]): number {
+  if (!a.length) return NaN;
+  const s = [...a].sort((x, y) => x - y);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
