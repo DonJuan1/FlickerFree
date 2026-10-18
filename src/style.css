@@ -316,3 +316,10 @@ table.values td {
   display: flex;
   align-items: center;
 }
+
+.warn {
+  color: var(--accent);
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+  margin: 0 0 12px;
+}

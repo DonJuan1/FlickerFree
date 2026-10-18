@@ -36,7 +36,8 @@ describe('measure', () => {
     expect(r.frequency / 240).toBeGreaterThan(0.997);
     expect(r.frequency / 240).toBeLessThan(1.003);
     expect(1 / r.best).toBeCloseTo(48, 0);
-    expect(r.refined).toBe(true);
+    // Either refined with extra steps or pinned down by the coherent model.
+    expect(r.refined || r.reference === 'coherent').toBe(true);
     expect(r.clean.length).toBe(9);
   });
 

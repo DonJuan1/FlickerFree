@@ -7,7 +7,7 @@ import {
   fitFlicker,
   flickerEnergy,
   isFlicker,
-  parabolaVertex,
+  nullVertex,
   shutterAngle,
   stepProfile,
 } from '../src/lib/analysis';
@@ -99,16 +99,24 @@ describe('clean values', () => {
   });
 });
 
-describe('parabolaVertex', () => {
-  it('finds the minimum of a noisy parabola', () => {
-    const pts = Array.from({ length: 9 }, (_, i) => {
-      const x = 0.019 + i * 0.00025;
-      return { x, y: 3 * (x - 0.02013) ** 2 + 1e-6 + (i % 2 ? 1e-9 : -1e-9) };
+describe('nullVertex', () => {
+  const sample = (f: (x: number) => number, lo: number, hi: number) =>
+    Array.from({ length: 9 }, (_, i) => {
+      const x = lo + ((hi - lo) * i) / 8;
+      return { x, y: f(x) + (i % 2 ? 1e-9 : -1e-9) };
     });
-    expect(parabolaVertex(pts)!).toBeCloseTo(0.02013, 5);
+
+  it('finds the bottom of a U-shaped dip off the window centre', () => {
+    const v = nullVertex(sample((x) => 3 * (x - 0.02013) ** 2 + 1e-6, 0.019, 0.021))!;
+    expect(v).toBeCloseTo(0.02013, 5);
   });
 
-  it('rejects a downward parabola', () => {
-    expect(parabolaVertex([{ x: 0, y: 0 }, { x: 1, y: 1 }, { x: 2, y: 0 }])).toBeNull();
+  it('finds the bottom of a V-shaped dip off the window centre', () => {
+    const v = nullVertex(sample((x) => 0.5 * Math.abs(x - 0.02013) + 1e-6, 0.019, 0.021))!;
+    expect(v).toBeCloseTo(0.02013, 5);
+  });
+
+  it('rejects a bump', () => {
+    expect(nullVertex(sample((x) => -((x - 1) ** 2), 0, 2))).toBeNull();
   });
 });

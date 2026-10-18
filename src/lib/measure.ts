@@ -1,19 +1,21 @@
 // Measurement flow: ISO calibration, coarse exposure sweep, flicker-frequency fit,
 // then fine refinement around the clean value closest to 180 degrees.
 
+import { coherentFrequency } from './coherent';
 import {
   SweepModel,
   cleanExposures,
   closestTo,
   exposureGrid,
-  fitContent,
   fitFlicker,
   isFlicker,
-  parabolaVertex,
+  nullContrast,
+  nullFit,
   snapExposure,
   stepProfile,
   type FlickerFit,
   type FrameSample,
+  type NullFit,
   type StepProfile,
 } from './analysis';
 
@@ -29,6 +31,8 @@ export interface MeasureCamera {
   exposure: Range;
   iso?: Range;
   setExposure(exposure: number, iso?: number): Promise<void>;
+  /** Makes the next frame the alignment reference (frames are aligned against hand shake). */
+  resetAlignment?(): void;
   /** Drops `discard` frames (pipeline latency), then returns the next `count`. */
   capture(discard: number, count: number): Promise<FrameSample[]>;
 }
@@ -45,6 +49,8 @@ export interface MeasureOptions {
   framesPerStep?: number;
   signal?: AbortSignal;
   onProgress?: (p: Progress) => void;
+  /** Sweep order; default two interleaved passes. */
+  order?: 'monotonic' | 'twoPass';
 }
 
 export interface Progress {
@@ -60,6 +66,10 @@ export interface StepRecord {
   iso?: number;
   meanLuma: number;
   clipFraction: number;
+  /** Frames dropped because alignment failed or the screen moved out of the region. */
+  unaligned: number;
+  /** Mean alignment offset of the step's frames (analysis pixels). */
+  shift?: [number, number];
   valid: boolean;
   /** Band energy against the fitted nulls (filled in after the fit). */
   energy?: number;
@@ -75,10 +85,31 @@ interface Common {
   /** Steps skipped because the image was too bright or too dark. */
   skipped: number;
   fit: FlickerFit | null;
+  /** The coherent model's best candidate, trusted or not (diagnostics). */
+  coherent?: {
+    frequency: number;
+    explained: number;
+    nullContrast: number;
+    significance: number;
+    candidates?: { f: number; explained: number; significance: number; nullContrast?: number }[];
+  };
 }
 
+/** Which content reference the result was refined against (see measure()). */
+export type Reference = 'coherent' | 'average' | 'anchors';
+
 export type MeasureResult =
-  | (Common & { kind: 'flicker'; frequency: number; best: number; clean: number[]; refined: boolean })
+  | (Common & {
+      kind: 'flicker';
+      frequency: number;
+      best: number;
+      clean: number[];
+      refined: boolean;
+      reference: Reference;
+      explained?: number;
+      /** False when the frequency could not be pinned down reliably (show as a best guess). */
+      confident: boolean;
+    })
   | (Common & { kind: 'no-clean'; frequency: number })
   | (Common & { kind: 'none' })
   | (Common & { kind: 'error'; message: string });
@@ -86,8 +117,18 @@ export type MeasureResult =
 const TARGET_LUMA = 115;
 const MIN_LUMA = 12;
 const MAX_CLIP = 0.02;
-/** Minimum explained band variance to trust the band-model content estimate. */
-const CONTENT_MODEL_MIN = 0.95;
+/** Largest change the refinement may make to the coarse estimate (relative). */
+const MAX_REFINE_MOVE = 0.03;
+/** Minimum explained band variance for the coherent model to be trusted. */
+const COHERENT_MIN = 0.3;
+/**
+ * Minimum significance of the coherent frequency's peak in the broad scan (robust z).
+ * Correct identifications scored 16-41 (simulation and browser tests with a synthetic
+ * camera), wrong ones at most ~12 (busy screen content plus hand shake).
+ */
+const COHERENT_SIGNIFICANCE = 15;
+/** The null-based fit counts as confident only with this dip contrast and a refinement. */
+const CONFIDENT_CONTRAST = 0.9;
 /** The sweep always reaches at least this long, so flicker down to ~40 Hz shows two nulls. */
 const MIN_SWEEP_MAX = 1 / 20;
 
@@ -101,13 +142,14 @@ export async function measure(cam: MeasureCamera, opt: MeasureOptions): Promise<
   const range: [number, number] = [eMin, resultMax];
   const swept: [number, number] = [eMin, sweepMax];
   let fit: FlickerFit | null = null;
-  const common = (): Common => ({ range, swept, steps, skipped: steps.filter((s) => !s.valid).length, fit });
+  let coherentInfo: Common['coherent'];
+  const common = (): Common => ({ range, swept, steps, skipped: steps.filter((s) => !s.valid).length, fit, coherent: coherentInfo });
   if (!(resultMax > eMin)) {
     return { ...common(), kind: 'error', message: 'The camera does not support the needed exposure range.' };
   }
 
   const grid = exposureGrid(eMin, sweepMax, opt.ratio ?? 1.025, cam.exposure.step);
-  const refineEstimate = 54;
+  const refineEstimate = 72;
   let total = 4 + grid.length + refineEstimate;
   let done = 0;
   const progress = (phase: Progress['phase'], exposure?: number) => opt.onProgress?.({ phase, done, total, exposure });
@@ -141,28 +183,42 @@ export async function measure(cam: MeasureCamera, opt: MeasureOptions): Promise<
     const k = eRef * iso;
     isoFor = (e) => clampIso(k / e);
   }
+  // Align everything to a frame at the mid exposure: moderate bands, low noise.
+  cam.resetAlignment?.();
+  await cam.capture(0, 1);
   total = done + grid.length + refineEstimate;
 
+  let stepCount = 0;
   const step = async (phase: Progress['phase'], e: number): Promise<StepRecord> => {
     checkAbort();
     progress(phase, e);
     const iso = isoFor(e);
     await cam.setExposure(e, iso);
-    const frames = await cam.capture(discard, perStep);
+    // Uneven step lengths: with equal ones, flicker frequencies 1 / (step duration) apart
+    // look alike to the coherent model.
+    const frames = await cam.capture(discard + (stepCount++ % 3), perStep);
     done++;
     const rec = record(phase, e, iso, frames);
     steps.push(rec);
     return rec;
   };
 
-  for (const e of grid) await step('sweep', e);
+  // Two interleaved passes: even steps going up, odd steps coming down. If exposure rose
+  // steadily with time, a band drifting slowly over the sweep would look like a frequency
+  // offset; this way neighbouring exposures are measured far apart in time, while each
+  // change between consecutive steps stays small (settling lag barely matters).
+  for (const e of opt.order === 'monotonic' ? grid : twoPass(grid)) await step('sweep', e);
 
-  const valid = steps.filter((s) => s.phase === 'sweep' && s.valid);
+  const sweep = steps.filter((s) => s.phase === 'sweep');
+  const valid = sweep.filter((s) => s.valid);
   if (valid.length < 6) {
+    const moved = sweep.filter((s) => s.unaligned > s.profile.times.length).length > sweep.length / 2;
     return {
       ...common(),
       kind: 'error',
-      message: 'The image was too bright or too dark at most shutter speeds. Lower the screen brightness or move closer.',
+      message: moved
+        ? 'The phone moved too much. Rest it against something or hold it very still and try again.'
+        : 'The image was too bright or too dark at most shutter speeds. Lower the screen brightness or move closer.',
     };
   }
   progress('analyse');
@@ -175,46 +231,118 @@ export async function measure(cam: MeasureCamera, opt: MeasureOptions): Promise<
   // Band energy reference: the content estimate from the band-model fit when the model
   // explains the sweep (bands standing still between frames), else the centroid of the
   // predicted nulls (rolling bands, where comparing nulls is reliable).
+  // Content references for band energies, as weights over the sweep's step means:
+  //  - model:   band-model fit (separates content from standing bands),
+  //  - average: mean of the steps beyond the first null (moving bands cancel),
+  //  - anchors: centroid of the steps at the predicted nulls.
+  // Each can carry leftover band; with moving bands the refinement keeps whichever reaches
+  // the lowest dip, since at a true null the band vanishes against a clean reference.
   let frequency = fit.frequency;
-  const content = fitContent(model, frequency);
-  const anchors = fit.anchors;
-  let energyOf = (p: StepProfile) => model.energyOf(p, anchors);
-  if (content && content.explained >= CONTENT_MODEL_MIN) {
-    frequency = content.frequency;
-    energyOf = (p) => model.energyVsContent(p, content.weights);
+  // Coherent check: the band model over all frames with their capture times pins the
+  // frequency down to ~0.1 / (sweep duration) and tells real from spurious candidates.
+  // Trusted when its peak stands out clearly in the broad scan; it is then final.
+  progress('analyse');
+  await new Promise((r) => setTimeout(r, 0));
+  const coh = coherentFrequency(model, fit);
+  coherentInfo = coh
+    ? {
+        frequency: coh.frequency,
+        explained: coh.explained,
+        nullContrast: nullContrast(model, coh.frequency),
+        significance: coh.significance ?? 0,
+        candidates: coh.candidates?.map((c) => ({ ...c, nullContrast: +nullContrast(model, c.f).toFixed(3) })),
+      }
+    : undefined;
+  const coherent = coh && (coh.significance ?? 0) >= COHERENT_SIGNIFICANCE && coh.explained >= COHERENT_MIN ? coh : null;
+  if (coherent) frequency = coherent.frequency;
+  // Otherwise refine against content references built from the sweep (see below).
+  const average = new Float64Array(model.steps.length);
+  {
+    const use = model.steps.map((s) => s.exposure >= 0.9 / frequency);
+    const count = use.filter(Boolean).length;
+    model.steps.forEach((_, i) => {
+      if (count >= 8 ? use[i] : true) average[i] = 1 / (count >= 8 ? count : model.steps.length);
+    });
   }
-  for (const s of valid) s.energy = energyOf(s.profile);
+  const references: { name: Reference; w: Float64Array }[] = coherent
+    ? [{ name: 'coherent', w: coherent.weights }]
+    : [
+        { name: 'average', w: average },
+        { name: 'anchors', w: model.anchorWeights(fit.anchors) },
+      ];
+  const primary = references[0];
+  for (const s of valid) s.energy = model.energyVsContent(s.profile, primary.w);
   const target = 1 / (2 * opt.fps);
   let best = closestTo(cleanExposures(frequency, eMin, resultMax), target);
   if (best === undefined) return { ...common(), kind: 'no-clean', frequency };
 
-  // Refinement: measure finely around the chosen null, sweeping up and then down so the
-  // camera's settling lag cancels, and take the vertex of a parabola through the energies.
+  // Refinement (when the coherent model isn't trusted): measure finely around the chosen
+  // null, sweeping up and then down so the camera's settling lag cancels, and locate the
+  // bottom of the dip in the energies against two content references from the sweep:
+  //  - average: mean of the steps beyond the first null (moving bands cancel),
+  //  - anchors: centroid of the steps at the predicted nulls;
+  // whichever reaches the lowest dip wins, since at a true null the band vanishes against a
+  // clean reference. The up/down repeats give the noise level; a window whose edges don't
+  // rise clearly above it is widened (up to the neighbouring antinodes), else the estimate
+  // is kept.
+  if (coherent) {
+    const clean = cleanExposures(frequency, eMin, resultMax);
+    best = closestTo(clean, target) ?? best;
+    return { ...common(), kind: 'flicker', frequency, best, clean, refined: false, reference: 'coherent', explained: coherent.explained, confident: true };
+  }
   const n = Math.round(best * frequency);
+  const start = best;
   let center = best;
   let half = Math.min(0.04, 0.3 / n);
+  const maxHalf = 0.4 / n;
   let refined = false;
+  let reference: Reference = primary.name;
   total = done + refineEstimate;
-  for (let iter = 0; iter < 3; iter++) {
+  for (let iter = 0; iter < 4; iter++) {
     const values = [
       ...new Set(Array.from({ length: 9 }, (_, i) => snapExposure(center * (1 - half + (2 * half * i) / 8), cam.exposure.step))),
     ].filter((e) => e >= cam.exposure.min && e <= cam.exposure.max);
-    if (values.length < 3) break;
-    const sums = new Map<number, { s: number; c: number }>();
+    if (values.length < 4) break;
+    // Per reference: energies of each exposure's runs.
+    const runs = references.map(() => new Map<number, number[]>());
     for (const e of [...values, ...[...values].reverse()]) {
       const rec = await step('refine', e);
       if (!rec.valid) continue;
-      rec.energy = energyOf(rec.profile);
-      const acc = sums.get(e) ?? { s: 0, c: 0 };
-      acc.s += rec.energy;
-      acc.c++;
-      sums.set(e, acc);
+      references.forEach((r, k) => {
+        const en = model.energyVsContent(rec.profile, r.w);
+        runs[k].set(e, [...(runs[k].get(e) ?? []), en]);
+      });
+      rec.energy = model.energyVsContent(rec.profile, primary.w);
     }
-    const pts = [...sums].map(([x, { s, c }]) => ({ x, y: s / c }));
-    if (pts.length < 3) break;
-    const vertex = parabolaVertex(pts) ?? pts.reduce((a, b) => (b.y < a.y ? b : a)).x;
-    if (Math.abs(vertex / center - 1) > half) break;
+    // Band amplitude falls as 1/exposure, so energy x exposure^2 makes the dip symmetric.
+    const w = (e: number) => (e / center) ** 2;
+    let chosen: { name: Reference; fit: NullFit; rise: number } | null = null;
+    let informative = false;
+    references.forEach((r, k) => {
+      const pts = [...runs[k]].map(([x, ys]) => ({ x, y: (w(x) * ys.reduce((a, b) => a + b, 0)) / ys.length }));
+      if (pts.length < 4) return;
+      const pairs = [...runs[k]].filter(([, ys]) => ys.length === 2);
+      const sigma = pairs.length ? Math.sqrt(pairs.reduce((a, [x, [u, d]]) => a + (w(x) * (u - d)) ** 2, 0) / pairs.length / 4) : 0;
+      const ys = pts.map((p) => p.y);
+      const rise = Math.max(ys[0], ys[ys.length - 1]) - Math.min(...ys);
+      if (rise < 6 * sigma) return;
+      informative = true;
+      const f = nullFit(pts);
+      // Cleanest reference: lowest dip floor relative to how far the edges rise.
+      if (f && (!chosen || f.b / rise < chosen.fit.b / chosen.rise)) chosen = { name: r.name, fit: f, rise };
+    });
+    if (!informative) {
+      if (half >= maxHalf) break;
+      half = Math.min(maxHalf, half * 2);
+      continue;
+    }
+    if (!chosen) break;
+    const pick: { name: Reference; fit: NullFit } = chosen;
+    const vertex = pick.fit.x0;
+    // The coarse fit is good to a step or so; a refinement that wanders further is noise.
+    if (Math.abs(vertex / center - 1) > half || Math.abs(vertex / start - 1) > MAX_REFINE_MOVE) break;
     refined = true;
+    reference = pick.name;
     const moved = Math.abs(vertex / center - 1);
     center = vertex;
     frequency = n / center;
@@ -224,18 +352,28 @@ export async function measure(cam: MeasureCamera, opt: MeasureOptions): Promise<
 
   const clean = cleanExposures(frequency, eMin, resultMax);
   best = closestTo(clean, target) ?? center;
-  return { ...common(), kind: 'flicker', frequency, best, clean, refined };
+  const confident = refined && fit.confidence >= CONFIDENT_CONTRAST;
+  return { ...common(), kind: 'flicker', frequency, best, clean, refined, reference, confident };
 }
 
-function record(phase: Progress['phase'], exposure: number, iso: number | undefined, frames: FrameSample[]): StepRecord {
+/** Even-indexed values ascending, then odd-indexed values descending. */
+export function twoPass<T>(values: T[]): T[] {
+  return [...values.filter((_, i) => i % 2 === 0), ...values.filter((_, i) => i % 2 === 1).reverse()];
+}
+
+function record(phase: Progress['phase'], exposure: number, iso: number | undefined, all: FrameSample[]): StepRecord {
+  const frames = all.filter((f) => f.aligned !== false);
   const meanLuma = avg(frames.map((f) => f.meanLuma));
   const clipFraction = avg(frames.map((f) => f.clipFraction));
+  const shifts = all.flatMap((f) => (f.shift ? [f.shift] : []));
   return {
     phase,
     exposure,
     iso,
     meanLuma,
     clipFraction,
+    unaligned: all.length - frames.length,
+    shift: shifts.length ? [avg(shifts.map((s) => s[0])), avg(shifts.map((s) => s[1]))] : undefined,
     valid: frames.length >= 2 && meanLuma >= MIN_LUMA && clipFraction <= MAX_CLIP,
     profile: stepProfile(exposure, frames),
   };

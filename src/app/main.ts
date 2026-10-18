@@ -2,7 +2,7 @@ import { Camera, REGION } from '../lib/camera';
 import { angleText, fpsText, shutterText } from '../lib/format';
 import { measure, type MeasureResult, type Progress } from '../lib/measure';
 
-const APP_VERSION = 2;
+const APP_VERSION = 4;
 const FPS_KEY = 'flickerfree.fps';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -69,15 +69,14 @@ function unsupported(msg: string) {
   measureBtn.disabled = true;
 }
 
-/** Outline the analysed area: readout axis = the frame's short side. */
+/** Outline the analysed area (centred; the rest of the frame is margin for hand shake). */
 function placeRegion() {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   if (!vw || !vh) return;
-  const landscape = vw >= vh;
-  const w = landscape ? REGION.long : REGION.readout;
-  const h = landscape ? REGION.readout : REGION.long;
-  Object.assign(regionEl.style, { left: `${((1 - w) / 2) * 100}%`, width: `${w * 100}%`, top: `${((1 - h) / 2) * 100}%`, height: `${h * 100}%` });
+  const m = `${((1 - REGION) / 2) * 100}%`;
+  const size = `${REGION * 100}%`;
+  Object.assign(regionEl.style, { left: m, width: size, top: m, height: size });
   // Keep the stage at the video's aspect ratio, also when its height is capped, so the
   // outline (in % of the stage) lines up with the picture.
   const stage = $('stage');
@@ -161,10 +160,24 @@ function showResult(r: MeasureResult, fps: number) {
       el('p', 'muted', `The screen flickers at ${r.frequency.toFixed(1)} Hz; no shutter speed from ${rangeText} removes it.`),
     );
   } else {
+    if (!r.confident) {
+      resultEl.append(
+        el('div', 'headline', 'Flicker found, frequency unclear'),
+        el(
+          'p',
+          'warn',
+          'The screen flickers, but its frequency could not be pinned down reliably, so no shutter speed is recommended. Show a plain white image on the screen, keep the phone still and measure again.',
+        ),
+        el('p', 'muted small', `Best guess, not reliable: ${shutterText(r.best)} s (${angleText(r.best, fps)}), ${r.frequency.toFixed(1)} Hz`),
+      );
+      if (r.skipped) resultEl.append(el('p', 'muted small', `${r.skipped} step${r.skipped > 1 ? 's were' : ' was'} too bright or too dark and skipped.`));
+      resultEl.hidden = false;
+      return;
+    }
     resultEl.append(
       el('div', 'speed', `${shutterText(r.best)} s`),
       el('div', 'angle', `${angleText(r.best, fps)} at ${fpsText(fps)} fps`),
-      el('p', 'muted small', `Screen flicker: ${r.frequency.toFixed(2)} Hz${r.refined ? '' : ' (not refined)'}`),
+      el('p', 'muted small', `Screen flicker: ${r.frequency.toFixed(2)} Hz`),
     );
     const others = r.clean.filter((e) => e !== r.best);
     if (others.length) {
@@ -206,19 +219,29 @@ function report(full: boolean) {
       height: camera.caps.height,
     },
     video: { w: video.videoWidth, h: video.videoHeight },
+    timeSource: camera?.timeSource,
+    texture: camera?.texture !== undefined ? +camera.texture.toFixed(4) : null,
+    frameIntervals: r && frameIntervalStats(r),
     result: r && {
       kind: r.kind,
       frequency: 'frequency' in r ? round(r.frequency, 8) : null,
       best: 'best' in r ? round(r.best, 8) : null,
       clean: 'clean' in r ? r.clean.map((e) => round(e, 8)) : null,
       refined: 'refined' in r ? r.refined : null,
+      confident: 'confident' in r ? r.confident : null,
+      reference: 'reference' in r ? r.reference : null,
+      explained: 'explained' in r && r.explained !== undefined ? +r.explained.toFixed(4) : null,
       message: 'message' in r ? r.message : null,
       range: r.range,
       swept: r.swept,
       skipped: r.skipped,
       fit: r.fit && { ...r.fit, anchors: r.fit.anchors.map((a) => round(a, 6)) },
+      coherent: r.coherent,
     },
-    // phase, exposure (s), iso, mean luma, clip fraction, valid, band energy, self covariance
+    grid: camera?.grid,
+    // phase, exposure (s), iso, mean luma, clip fraction, valid, band energy, self covariance,
+    // unaligned frames, mean alignment shift [dx, dy] (analysis px); full data adds frame
+    // times and both channels' mean grids (row-major, grid.w x grid.h, log luma minus mean).
     steps: r?.steps.map((s) => [
       s.phase[0],
       round(s.exposure),
@@ -228,20 +251,21 @@ function report(full: boolean) {
       s.valid ? 1 : 0,
       round(s.energy, 4),
       round(s.profile.selfCov, 4),
-      ...(full ? [s.profile.times.map((t) => round(t, 9)), s.profile.mean.map((m) => downsample(m, 96).map((v) => round(v, 4)))] : []),
+      s.unaligned,
+      s.shift ? s.shift.map((v) => +v.toFixed(2)) : null,
+      ...(full ? [s.profile.times.map((t) => round(t, 9)), s.profile.mean.map((m) => [...m].map((v) => +v.toFixed(5)))] : []),
     ]),
   };
 }
 
-function downsample(a: Float64Array, n: number): number[] {
-  if (a.length <= n) return [...a];
-  return Array.from({ length: n }, (_, i) => {
-    const from = Math.floor((i * a.length) / n);
-    const to = Math.floor(((i + 1) * a.length) / n);
-    let s = 0;
-    for (let k = from; k < to; k++) s += a[k];
-    return s / (to - from);
-  });
+/** Frame interval statistics within steps (ms): shows how regular the frame times are. */
+function frameIntervalStats(r: MeasureResult) {
+  const d = r.steps.flatMap((s) => s.profile.times.slice(1).map((t, i) => (t - s.profile.times[i]) * 1000));
+  if (!d.length) return null;
+  const sorted = [...d].sort((a, b) => a - b);
+  const med = sorted[sorted.length >> 1];
+  const mad = [...d.map((v) => Math.abs(v - med))].sort((a, b) => a - b)[d.length >> 1];
+  return { count: d.length, median: +med.toFixed(3), mad: +mad.toFixed(3), min: +sorted[0].toFixed(3), max: +sorted[sorted.length - 1].toFixed(3) };
 }
 
 $('copyDiag').addEventListener('click', async () => {

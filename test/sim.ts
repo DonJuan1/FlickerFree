@@ -16,15 +16,25 @@ export interface Source {
 
 export interface SimOptions {
   sources: Source[];
+  /** Grid cells along the camera's readout axis. */
   rows?: number;
-  strips?: number;
-  /** Time to read out all rows (s). */
+  /** Grid cells across it (even/odd columns become channels A/B). */
+  cols?: number;
+  /** Time for the camera to read out the analysed rows (s). */
   readout?: number;
+  /**
+   * Time for the screen to scan across the analysed columns (s); 0 = all screen rows
+   * flicker in phase. Non-zero tilts the bands, as with OLED screens scanning their rows
+   * perpendicular to the camera's readout.
+   */
+  scan?: number;
   /** Phone frame rate; frame start times advance by 1/fps. */
   cameraFps?: number;
-  /** Profile noise (luma units, after averaging). */
+  /** Error (s, standard deviation) of the reported frame times. */
+  timeJitter?: number;
+  /** Per-cell noise (luma units). */
   noise?: number;
-  /** Content: 'flat', 'smooth' (different per strip) or 'edges' (adds full-width structures). */
+  /** Screen content: 'flat', 'smooth' (2D waves) or 'edges' (text-like rows and boxes). */
   content?: 'flat' | 'smooth' | 'edges';
   seed?: number;
 }
@@ -65,56 +75,62 @@ function gauss(r: () => number) {
 
 /** Simulates `count` frames at exposure e (seconds), starting at frame index `frame0`. */
 export function simulateFrames(opt: SimOptions, e: number, count: number, frame0 = 0): FrameSample[] {
-  const rows = opt.rows ?? 360;
-  const strips = opt.strips ?? 4;
+  const rows = opt.rows ?? 48;
+  const cols = opt.cols ?? 32;
   const readout = opt.readout ?? 0.025;
+  const scan = opt.scan ?? 0;
   const fps = opt.cameraFps ?? 30.02;
   const noise = opt.noise ?? 0.15;
   const r = rng((opt.seed ?? 1) * 7919 + frame0 * 104729 + Math.round(e * 1e7));
-  const content = buildContent(opt.content ?? 'smooth', strips, rows, opt.seed ?? 1);
+  const content = buildContent(opt.content ?? 'smooth', rows, cols, opt.seed ?? 1);
   const out: FrameSample[] = [];
   for (let k = 0; k < count; k++) {
     const tFrame = (frame0 + k) / fps;
-    const band = new Float64Array(rows);
-    for (let y = 0; y < rows; y++) {
-      const t = tFrame + (y / rows) * readout;
-      let v = 1;
-      for (const s of opt.sources) v += windowAverage(s, t, e) - 1;
-      band[y] = v;
-    }
+    const half = cols >> 1;
+    const a = new Float32Array(rows * half);
+    const b = new Float32Array(rows * half);
     let sum = 0;
     let clip = 0;
-    const profiles = content.map((c) => {
-      const p = new Float32Array(rows);
-      for (let y = 0; y < rows; y++) {
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < half * 2; x++) {
+        const t = tFrame + (y / rows) * readout - (x / cols) * scan;
+        let band = 1;
+        for (const s of opt.sources) band += windowAverage(s, t, e) - 1;
         // Display gamma on top of linear light; the exposure itself is ISO-compensated.
-        const lum = 255 * Math.pow(Math.min(1, Math.max(0, 0.4 * c[y] * band[y])), 1 / 2.2) + noise * gauss(r);
-        p[y] = lum;
+        const lum = 255 * Math.pow(Math.min(1, Math.max(0, 0.4 * content[y * cols + x] * band)), 1 / 2.2) + noise * gauss(r);
+        (x % 2 ? b : a)[y * half + (x >> 1)] = lum;
         sum += lum;
         if (lum >= 250) clip++;
       }
-      return p;
-    });
-    out.push({ strips: profiles, meanLuma: sum / (rows * strips), clipFraction: clip / (rows * strips), time: tFrame });
+    }
+    const n = rows * half * 2;
+    const reported = tFrame + (opt.timeJitter ?? 0) * gauss(r);
+    out.push({ channels: [a, b], meanLuma: sum / n, clipFraction: clip / n, time: reported });
   }
   return out;
 }
 
-function buildContent(kind: 'flat' | 'smooth' | 'edges', strips: number, rows: number, seed: number): Float64Array[] {
+function buildContent(kind: 'flat' | 'smooth' | 'edges', rows: number, cols: number, seed: number): Float64Array {
   const r = rng(seed * 31337 + 1);
-  const common = new Float64Array(rows);
-  if (kind === 'edges') {
-    // Full-width structures (e.g. a taskbar, letterbox bars) look the same in every strip.
-    for (let y = 0; y < rows; y++) common[y] = y > rows * 0.85 ? -0.35 : y < rows * 0.1 ? -0.2 : 0;
-  }
-  return Array.from({ length: strips }, () => {
-    const c = new Float64Array(rows);
-    const waves = kind === 'flat' ? [] : Array.from({ length: 6 }, () => ({ a: 0.15 * r(), k: 1 + 25 * r(), p: r() * 6.28 }));
-    for (let y = 0; y < rows; y++) {
-      let v = 1 + common[y];
-      for (const w of waves) v += w.a * Math.sin((w.k * 2 * Math.PI * y) / rows + w.p);
-      c[y] = Math.max(0.05, v);
+  const c = new Float64Array(rows * cols).fill(1);
+  if (kind === 'flat') return c;
+  const waves = Array.from({ length: 8 }, () => ({ a: 0.12 * r(), ky: 1 + 12 * r(), kx: 12 * r() - 6, p: r() * 6.28 }));
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      let v = 1;
+      for (const w of waves) v += w.a * Math.sin(2 * Math.PI * ((w.ky * y) / rows + (w.kx * x) / cols) + w.p);
+      c[y * cols + x] = v;
     }
-    return c;
-  });
+  }
+  if (kind === 'edges') {
+    // Text-like structure: dark rows of glyph boxes and a bar along one edge.
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        if (x > cols * 0.88) c[y * cols + x] *= 0.4;
+        else if (y % 6 === 2 && r() < 0.6) c[y * cols + x] *= 0.35;
+      }
+    }
+  }
+  for (let i = 0; i < c.length; i++) c[i] = Math.max(0.05, c[i]);
+  return c;
 }
