@@ -3,6 +3,7 @@
 // aligned against hand shake, then averaged into a 2D grid of cells.
 
 import type { FrameSample } from './analysis';
+import { backCameras, pickCamera, type CameraDevice } from './devices';
 import type { MeasureCamera, Range } from './measure';
 import { Registrar, bilinear } from './register';
 
@@ -21,6 +22,25 @@ const EXPOSURE_UNIT = 1e-4;
 const MIN_PEAK = 0.05;
 /** Below this content detail level (see textureLevel) frames are not aligned. */
 const MIN_TEXTURE = 0.02;
+
+async function listCameras(): Promise<CameraDevice[]> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices
+      .filter((d) => d.kind === 'videoinput' && d.deviceId)
+      .map((d) => {
+        let facing: string[] | undefined;
+        try {
+          facing = (d as Partial<InputDeviceInfo>).getCapabilities?.().facingMode;
+        } catch {
+          // Not available in this browser.
+        }
+        return { deviceId: d.deviceId, label: d.label, facing };
+      });
+  } catch {
+    return [];
+  }
+}
 
 function isRange(v: unknown): v is RawRange {
   return typeof v === 'object' && v !== null && 'min' in v && 'max' in v;
@@ -53,15 +73,44 @@ export class Camera implements MeasureCamera {
     private readonly base: MediaTrackConstraints,
   ) {}
 
-  static async open(video: HTMLVideoElement): Promise<Camera> {
+  /** The phone's back cameras, main camera first (labels are known once access is granted). */
+  cameras: CameraDevice[] = [];
+
+  /**
+   * Opens a back camera: `preferred` (a deviceId) if it is still there, else the main one.
+   * Chrome may otherwise pick an extra lens (ultra-wide) for facingMode 'environment'.
+   */
+  static async open(video: HTMLVideoElement, preferred?: string | null): Promise<Camera> {
     const base: MediaTrackConstraints = {
       facingMode: { ideal: 'environment' },
       width: { ideal: 1280 },
       height: { ideal: 720 },
       frameRate: { ideal: 30 },
     };
-    const stream = await navigator.mediaDevices.getUserMedia({ video: base, audio: false });
+    const get = (deviceId?: string) =>
+      navigator.mediaDevices.getUserMedia({ video: deviceId ? { ...base, deviceId: { exact: deviceId } } : base, audio: false });
+    // A camera that was just stopped can take a moment to free up; a lens that fails to
+    // open falls back to the browser's choice.
+    const openStream = async (deviceId?: string) => {
+      if (!deviceId) return get();
+      try {
+        return await get(deviceId);
+      } catch {
+        await new Promise((r) => setTimeout(r, 500));
+        return get(deviceId).catch(() => get());
+      }
+    };
+    // Device ids and labels are listed only once camera access has been granted, so on a
+    // first visit the browser's choice opens first and is switched if needed.
+    let stream = await openStream(pickCamera(await listCameras(), preferred)?.deviceId);
+    const cameras = await listCameras();
+    const want = pickCamera(cameras, preferred);
+    if (want && want.deviceId !== stream.getVideoTracks()[0].getSettings().deviceId) {
+      stream.getTracks().forEach((t) => t.stop());
+      stream = await openStream(want.deviceId);
+    }
     const cam = new Camera(video, stream, stream.getVideoTracks()[0], base);
+    cam.cameras = backCameras(cameras);
     video.srcObject = stream;
     await video.play();
     cam.startLoop();
@@ -70,6 +119,10 @@ export class Camera implements MeasureCamera {
     await new Promise((r) => setTimeout(r, 700));
     cam.readCaps();
     return cam;
+  }
+
+  get deviceId(): string | undefined {
+    return this.track.getSettings().deviceId;
   }
 
   readCaps() {

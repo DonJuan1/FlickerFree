@@ -2,6 +2,7 @@
 // camera pipeline produces, from a model of the screen's light output over time.
 
 import type { FrameSample } from '../src/lib/analysis';
+import type { MeasureCamera } from '../src/lib/measure';
 
 export interface Source {
   /** Flicker frequency in Hz. */
@@ -36,6 +37,12 @@ export interface SimOptions {
   noise?: number;
   /** Screen content: 'flat', 'smooth' (2D waves) or 'edges' (text-like rows and boxes). */
   content?: 'flat' | 'smooth' | 'edges';
+  /**
+   * Linear screen light reaching the sensor per (second x ISO), 1 = full scale at
+   * exposure x ISO = 1. Omitted: the camera compensates every setting (constant brightness,
+   * like a camera still adjusting itself).
+   */
+  brightness?: number;
   seed?: number;
 }
 
@@ -73,8 +80,8 @@ function gauss(r: () => number) {
   return Math.sqrt(-2 * Math.log(r() + 1e-12)) * Math.cos(2 * Math.PI * r());
 }
 
-/** Simulates `count` frames at exposure e (seconds), starting at frame index `frame0`. */
-export function simulateFrames(opt: SimOptions, e: number, count: number, frame0 = 0): FrameSample[] {
+/** Simulates `count` frames at exposure e (seconds) and ISO, starting at frame index `frame0`. */
+export function simulateFrames(opt: SimOptions, e: number, count: number, frame0 = 0, iso = 100): FrameSample[] {
   const rows = opt.rows ?? 48;
   const cols = opt.cols ?? 32;
   const readout = opt.readout ?? 0.025;
@@ -83,6 +90,7 @@ export function simulateFrames(opt: SimOptions, e: number, count: number, frame0
   const noise = opt.noise ?? 0.15;
   const r = rng((opt.seed ?? 1) * 7919 + frame0 * 104729 + Math.round(e * 1e7));
   const content = buildContent(opt.content ?? 'smooth', rows, cols, opt.seed ?? 1);
+  const level = opt.brightness === undefined ? 0.4 : opt.brightness * e * iso;
   const out: FrameSample[] = [];
   for (let k = 0; k < count; k++) {
     const tFrame = (frame0 + k) / fps;
@@ -96,8 +104,8 @@ export function simulateFrames(opt: SimOptions, e: number, count: number, frame0
         const t = tFrame + (y / rows) * readout - (x / cols) * scan;
         let band = 1;
         for (const s of opt.sources) band += windowAverage(s, t, e) - 1;
-        // Display gamma on top of linear light; the exposure itself is ISO-compensated.
-        const lum = 255 * Math.pow(Math.min(1, Math.max(0, 0.4 * content[y * cols + x] * band)), 1 / 2.2) + noise * gauss(r);
+        // Display gamma on top of linear light.
+        const lum = 255 * Math.pow(Math.min(1, Math.max(0, level * content[y * cols + x] * band)), 1 / 2.2) + noise * gauss(r);
         (x % 2 ? b : a)[y * half + (x >> 1)] = lum;
         sum += lum;
         if (lum >= 250) clip++;
@@ -108,6 +116,35 @@ export function simulateFrames(opt: SimOptions, e: number, count: number, frame0
     out.push({ channels: [a, b], meanLuma: sum / n, clipFraction: clip / n, time: reported });
   }
   return out;
+}
+
+/**
+ * Simulated camera for measure(). The first `lag` frames after a change still show the old
+ * settings; `ignoreIso` models a camera that accepts but doesn't apply ISO (fixed at 400).
+ */
+export function simCamera(opt: SimOptions, lag = 3, step = 1e-4, ignoreIso = false): MeasureCamera & { calls: number } {
+  let frame = 0;
+  let current = { e: 1 / 100, iso: 400 };
+  let previous = current;
+  return {
+    calls: 0,
+    exposure: { min: 1e-4, max: 0.5, step },
+    iso: { min: 100, max: 3200, step: 1 },
+    async setExposure(e, iso) {
+      previous = current;
+      current = { e, iso: ignoreIso ? 400 : (iso ?? current.iso) };
+      this.calls++;
+    },
+    async capture(discard, count) {
+      const out = [];
+      for (let i = 0; i < discard + count; i++) {
+        const s = i < lag ? previous : current;
+        const [f] = simulateFrames(opt, s.e, 1, frame++, s.iso);
+        if (i >= discard) out.push(f);
+      }
+      return out;
+    },
+  };
 }
 
 function buildContent(kind: 'flat' | 'smooth' | 'edges', rows: number, cols: number, seed: number): Float64Array {

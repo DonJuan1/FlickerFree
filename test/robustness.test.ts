@@ -1,30 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { cleanExposures, closestTo } from '../src/lib/analysis';
-import { measure, type MeasureCamera } from '../src/lib/measure';
-import { simulateFrames, type SimOptions } from './sim';
-
-/** Simulated camera; the first `lag` frames after a change still show the old exposure. */
-function camera(opt: SimOptions, lag: number): MeasureCamera {
-  let frame = 0;
-  let current = 0.01;
-  let previous = current;
-  return {
-    exposure: { min: 1e-4, max: 0.5, step: 1e-4 },
-    iso: { min: 100, max: 3200, step: 1 },
-    async setExposure(e) {
-      previous = current;
-      current = e;
-    },
-    async capture(discard, count) {
-      const out = [];
-      for (let i = 0; i < discard + count; i++) {
-        const [f] = simulateFrames(opt, i < lag ? previous : current, 1, frame++);
-        if (i >= discard) out.push(f);
-      }
-      return out;
-    },
-  };
-}
+import { measure } from '../src/lib/measure';
+import { simCamera, type SimOptions } from './sim';
 
 // Screens x phone timing x content x project fps, including bands locked to the phone's
 // frame rate (30 fps vs 60/120/240 Hz) and rolling ones.
@@ -54,22 +31,25 @@ const tilted: [string, SimOptions, number, number][] = [
 ];
 
 describe('tilted bands', () => {
-  for (const [name, opt, fps, tol] of tilted) {
-    it(name, async () => {
-      const f = opt.sources[0].f;
-      const r = await measure(camera(opt, 4), { fps });
-      const want = closestTo(cleanExposures(f, 1 / 250, 1 / fps), 1 / (2 * fps))!;
-      expect(r.kind).toBe('flicker');
-      if (r.kind !== 'flicker') return;
-      expect(Math.abs(r.best / want - 1)).toBeLessThan(tol);
-      expect(r.confident).toBe(true);
-    });
+  // Camera keeping its brightness constant, and one following exposure x ISO (calibrated).
+  for (const [name, base, fps, tol] of tilted) {
+    for (const opt of [base, { ...base, brightness: 0.05 }]) {
+      it(`${name}${opt.brightness ? ', calibrated brightness' : ''}`, async () => {
+        const f = opt.sources[0].f;
+        const r = await measure(simCamera(opt, 4), { fps });
+        const want = closestTo(cleanExposures(f, 1 / 250, 1 / fps), 1 / (2 * fps))!;
+        expect(r.kind).toBe('flicker');
+        if (r.kind !== 'flicker') return;
+        expect(Math.abs(r.best / want - 1)).toBeLessThan(tol);
+        expect(r.confident).toBe(true);
+      });
+    }
   }
 
   it('reports no flicker for steady screens', async () => {
     for (let seed = 1; seed <= 8; seed++) {
-      const opt: SimOptions = { sources: [], content: (['flat', 'smooth', 'edges'] as const)[seed % 3], seed, noise: [0.1, 0.3, 1, 2][seed % 4], readout: 0.005, scan: 0.006 };
-      expect((await measure(camera(opt, 4), { fps: 25 })).kind).toBe('none');
+      const opt: SimOptions = { sources: [], content: (['flat', 'smooth', 'edges'] as const)[seed % 3], seed, noise: [0.1, 0.3, 1, 2][seed % 4], readout: 0.005, scan: 0.006, brightness: seed % 2 ? 0.05 : undefined };
+      expect((await measure(simCamera(opt, 4), { fps: 25 })).kind).toBe('none');
     }
   }, 60000);
 });
@@ -79,7 +59,7 @@ describe('measure robustness', () => {
     const { duty, ...rest } = extra as Partial<SimOptions> & { duty?: number };
     it(`${f} Hz${duty ? ` PWM ${duty}` : ''}, phone ${rest.cameraFps} fps, ${rest.content}, project ${fps} fps`, async () => {
       const opt: SimOptions = { sources: [{ f, depth: duty ? 1 : 0.3, duty }], readout: 0.024, noise: 0.3, seed: f, ...rest };
-      const r = await measure(camera(opt, 4), { fps });
+      const r = await measure(simCamera(opt, 4), { fps });
       const want = closestTo(cleanExposures(f, 1 / 250, 1 / fps), 1 / (2 * fps))!;
       expect(r.kind).toBe('flicker');
       if (r.kind !== 'flicker') return;

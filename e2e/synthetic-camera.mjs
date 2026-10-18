@@ -7,6 +7,7 @@
 //   TILT=1 lets the screen scan its rows across the readout (tilted bands, like OLEDs).
 //   JITTER=1 adds hand shake (the content wanders a few pixels).
 //   CONTENT=plain shows a plain light image instead of text.
+//   BRIGHT=<factor> makes the screen that much brighter (3: too bright beyond ~1/45 s at min ISO).
 //
 // Needs a local Chromium: CHROMIUM_PATH, or the Playwright browser at /opt/pw-browsers.
 
@@ -38,7 +39,7 @@ const page = await context.newPage();
 page.on('pageerror', (e) => console.error('pageerror:', e.message));
 
 await page.addInitScript(
-  ({ f, duty, portrait, tilt, jitter, plainContent }) => {
+  ({ f, duty, portrait, tilt, jitter, plainContent, bright }) => {
     const W = portrait ? 360 : 640;
     const H = portrait ? 640 : 360;
     // Camera readout time across the frame's short side; the screen scans its own rows
@@ -99,7 +100,7 @@ await page.addInitScript(
     const draw = () => {
       const t0 = generator ? frameIndex / 30 : performance.now() / 1000;
       const e = state.exposureTime * 1e-4;
-      const gain = (e * state.iso) / (0.01 * 400);
+      const gain = (bright * e * state.iso) / (0.01 * 400);
       if (jitter) {
         vx = 0.9 * vx + 0.3 * (rnd() - 0.5);
         vy = 0.9 * vy + 0.3 * (rnd() - 0.5);
@@ -160,6 +161,7 @@ await page.addInitScript(
     tilt: !!process.env.TILT,
     jitter: !!process.env.JITTER,
     plainContent: process.env.CONTENT === 'plain',
+    bright: Number(process.env.BRIGHT ?? 1),
   },
 );
 
@@ -183,6 +185,7 @@ const fit = report.result?.fit;
 if (fit) console.log(`fit: f=${fit.frequency?.toFixed(2)} amp=${fit.amplitude?.toFixed(5)} floor=${fit.floor?.toFixed(5)} conf=${fit.confidence?.toFixed(2)} candidates=${fit.candidates?.map((c) => c.toFixed(1)).join(',')}`);
 console.log(`coherent: ${JSON.stringify(report.result?.coherent)}`);
 console.log(`texture: ${report.texture}`);
+console.log(`calibration: ${JSON.stringify(report.result?.calibration)} swept: ${JSON.stringify(report.result?.swept)} limited: ${JSON.stringify(report.result?.limited)} camera: ${JSON.stringify(report.camera)}`);
 if (process.env.DUMP) {
   const [download] = await Promise.all([page.waitForEvent('download'), page.click('#downloadDiag')]);
   await download.saveAs(process.env.DUMP);

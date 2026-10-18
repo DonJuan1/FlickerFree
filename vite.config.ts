@@ -9,6 +9,7 @@ export default defineConfig({
       input: {
         index: resolve(import.meta.dirname, 'index.html'),
         probe: resolve(import.meta.dirname, 'probe.html'),
+        target: resolve(import.meta.dirname, 'target.html'),
       },
     },
   },

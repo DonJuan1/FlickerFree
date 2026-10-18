@@ -17,6 +17,11 @@
   box-sizing: border-box;
 }
 
+/* The hidden attribute wins over display rules such as .row's flex. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);

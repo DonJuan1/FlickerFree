@@ -2,14 +2,19 @@ import { Camera, REGION } from '../lib/camera';
 import { angleText, fpsText, shutterText } from '../lib/format';
 import { measure, type MeasureResult, type Progress } from '../lib/measure';
 
-const APP_VERSION = 4;
+const APP_VERSION = 5;
 const FPS_KEY = 'flickerfree.fps';
+const CAMERA_KEY = 'flickerfree.camera';
+/** Grey test image to show on the measured screen. */
+const TARGET = new URL('./target.html', location.href);
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const video = $<HTMLVideoElement>('video');
 const regionEl = $('region');
 const cameraMsg = $('cameraMsg');
 const fpsSel = $<HTMLSelectElement>('fps');
+const lensRow = $('lensRow');
+const lensSel = $<HTMLSelectElement>('lens');
 const measureBtn = $<HTMLButtonElement>('measure');
 const stopBtn = $<HTMLButtonElement>('stop');
 const progressEl = $('progress');
@@ -25,18 +30,38 @@ let last: { result: MeasureResult; fps: number; at: string; ms: number } | null 
 
 // ---------- setup ----------
 
-try {
-  const saved = localStorage.getItem(FPS_KEY);
-  if (saved && [...fpsSel.options].some((o) => o.value === saved)) fpsSel.value = saved;
-} catch {
-  // Storage unavailable (private mode): keep the default.
-}
-fpsSel.addEventListener('change', () => {
+function stored(key: string): string | null {
   try {
-    localStorage.setItem(FPS_KEY, fpsSel.value);
+    return localStorage.getItem(key);
+  } catch {
+    // Storage unavailable (private mode): keep the default.
+    return null;
+  }
+}
+
+function store(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
   } catch {
     // ignore
   }
+}
+
+const savedFps = stored(FPS_KEY);
+if (savedFps && [...fpsSel.options].some((o) => o.value === savedFps)) fpsSel.value = savedFps;
+fpsSel.addEventListener('change', () => store(FPS_KEY, fpsSel.value));
+video.addEventListener('resize', placeRegion);
+
+// Another back camera (lens) on request, remembered; the main camera by default.
+lensSel.addEventListener('change', async () => {
+  store(CAMERA_KEY, lensSel.value);
+  measureBtn.disabled = true;
+  lensSel.disabled = true;
+  camera?.stop();
+  camera = null;
+  regionEl.hidden = true;
+  await start();
+  lensSel.disabled = false;
 });
 
 void start();
@@ -45,8 +70,11 @@ async function start() {
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
     return unsupported('The camera is only available over HTTPS in a browser that supports it.');
   }
+  errorEl.hidden = true;
+  cameraMsg.textContent = 'Starting camera...';
+  cameraMsg.hidden = false;
   try {
-    camera = await Camera.open(video);
+    camera = await Camera.open(video, stored(CAMERA_KEY));
   } catch (e) {
     cameraMsg.textContent = 'Camera unavailable.';
     showError(`Could not open the camera (${e instanceof Error ? e.message : String(e)}). Allow camera access and reload.`);
@@ -54,13 +82,19 @@ async function start() {
   }
   cameraMsg.hidden = true;
   placeRegion();
-  video.addEventListener('resize', placeRegion);
+  showLenses(camera);
   if (!camera.manualExposure) {
     return unsupported(
       'This phone or browser does not allow manual exposure control from a web page. FlickerFree needs Chrome on an Android phone whose camera supports it.',
     );
   }
   measureBtn.disabled = false;
+}
+
+function showLenses(cam: Camera) {
+  lensSel.replaceChildren(...cam.cameras.map((c, i) => new Option(i === 0 ? 'Main camera' : `Back camera ${i + 1}`, c.deviceId)));
+  lensSel.value = cam.deviceId ?? '';
+  lensRow.hidden = cam.cameras.length < 2;
 }
 
 function unsupported(msg: string) {
@@ -96,6 +130,7 @@ async function run() {
   abort = new AbortController();
   measureBtn.disabled = true;
   fpsSel.disabled = true;
+  lensSel.disabled = true;
   resultEl.hidden = true;
   errorEl.hidden = true;
   progressEl.hidden = false;
@@ -113,6 +148,7 @@ async function run() {
     progressEl.hidden = true;
     measureBtn.disabled = false;
     fpsSel.disabled = false;
+    lensSel.disabled = false;
     void lock?.release().catch(() => {});
     await camera.auto().catch(() => {});
   }
@@ -137,9 +173,17 @@ function showProgress(p: Progress) {
   }[p.phase];
 }
 
-function showError(msg: string) {
-  errorEl.textContent = msg;
+function showError(msg: string, withTarget = false) {
+  errorEl.replaceChildren(msg);
+  if (withTarget) errorEl.append(targetLink());
   errorEl.hidden = false;
+}
+
+function targetLink(): HTMLElement {
+  const p = Object.assign(document.createElement('p'), { className: 'small' });
+  const a = Object.assign(document.createElement('a'), { href: TARGET.href, target: '_blank', textContent: TARGET.host + TARGET.pathname });
+  p.append('Grey test image to open on the screen: ', a);
+  return p;
 }
 
 function showResult(r: MeasureResult, fps: number) {
@@ -149,7 +193,7 @@ function showResult(r: MeasureResult, fps: number) {
   const el = (tag: string, cls: string, text: string) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
 
   if (r.kind === 'error') {
-    showError(r.message);
+    showError(r.message, r.reason === 'too-bright' || r.reason === 'too-dark' || r.reason === 'exposure');
     return;
   }
   if (r.kind === 'none') {
@@ -166,11 +210,12 @@ function showResult(r: MeasureResult, fps: number) {
         el(
           'p',
           'warn',
-          'The screen flickers, but its frequency could not be pinned down reliably, so no shutter speed is recommended. Show a plain white image on the screen, keep the phone still and measure again.',
+          'The screen flickers, but its frequency could not be pinned down reliably, so no shutter speed is recommended. Show a plain grey image on the screen, keep the phone still and measure again.',
         ),
+        targetLink(),
         el('p', 'muted small', `Best guess, not reliable: ${shutterText(r.best)} s (${angleText(r.best, fps)}), ${r.frequency.toFixed(1)} Hz`),
       );
-      if (r.skipped) resultEl.append(el('p', 'muted small', `${r.skipped} step${r.skipped > 1 ? 's were' : ' was'} too bright or too dark and skipped.`));
+      notes(r);
       resultEl.hidden = false;
       return;
     }
@@ -192,10 +237,20 @@ function showResult(r: MeasureResult, fps: number) {
       resultEl.append(table);
     }
   }
-  if (r.skipped) {
-    resultEl.append(el('p', 'muted small', `${r.skipped} step${r.skipped > 1 ? 's were' : ' was'} too bright or too dark and skipped.`));
-  }
+  notes(r);
   resultEl.hidden = false;
+}
+
+/** Notes on what the sweep couldn't measure (screen too bright or dark in parts). */
+function notes(r: MeasureResult) {
+  const add = (text: string) => resultEl.append(Object.assign(document.createElement('p'), { className: 'muted small', textContent: text }));
+  if (r.limited?.slow) {
+    add(`Shutter speeds slower than ${shutterText(r.swept[1])} s were not tested: the screen is too bright for this phone there. A darker grey image tests the full range.`);
+  }
+  if (r.limited?.fast) {
+    add(`Shutter speeds faster than ${shutterText(r.swept[0])} s were not tested: the screen is too dark for this phone there. A lighter grey image tests the full range.`);
+  }
+  if (r.skipped) add(`${r.skipped} step${r.skipped > 1 ? 's were' : ' was'} too bright or too dark and skipped.`);
 }
 
 // ---------- diagnostics ----------
@@ -219,6 +274,7 @@ function report(full: boolean) {
       height: camera.caps.height,
     },
     video: { w: video.videoWidth, h: video.videoHeight },
+    camera: camera && { label: camera.track.label, backCameras: camera.cameras.map((c) => c.label) },
     timeSource: camera?.timeSource,
     texture: camera?.texture !== undefined ? +camera.texture.toFixed(4) : null,
     frameIntervals: r && frameIntervalStats(r),
@@ -234,6 +290,8 @@ function report(full: boolean) {
       message: 'message' in r ? r.message : null,
       range: r.range,
       swept: r.swept,
+      limited: r.limited ?? null,
+      calibration: r.calibration ? { ...r.calibration, k: round(r.calibration.k ?? undefined) } : null,
       skipped: r.skipped,
       fit: r.fit && { ...r.fit, anchors: r.fit.anchors.map((a) => round(a, 6)) },
       coherent: r.coherent,

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>FlickerFree test image</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: rgb(51, 51, 51);
+        overflow: hidden;
+        user-select: none;
+        -webkit-user-select: none;
+        touch-action: manipulation;
+      }
+      .hint {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: calc(24px + env(safe-area-inset-bottom));
+        margin: 0;
+        padding: 0 16px;
+        text-align: center;
+        font: 16px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        color: #ccc;
+        text-shadow: 0 0 4px #000;
+        transition: opacity 0.6s;
+        pointer-events: none;
+      }
+      .hint.faded {
+        opacity: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <p id="hint" class="hint"></p>
+    <script type="module" src="./src/target/main.ts"></script>
+  </body>
+</html>

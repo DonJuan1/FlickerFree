@@ -85,6 +85,14 @@ interface Common {
   /** Steps skipped because the image was too bright or too dark. */
   skipped: number;
   fit: FlickerFit | null;
+  /**
+   * Brightness calibration: k = exposure x ISO (exposure alone without ISO control) for the
+   * target luma, null if unknown; whether the measured luma followed ISO and exposure
+   * changes (null: not tested).
+   */
+  calibration?: { k: number | null; isoControl: boolean; exposureControl: boolean | null };
+  /** Parts of the sweep left out because the screen was too dark (fast) or bright (slow). */
+  limited?: { fast: boolean; slow: boolean };
   /** The coherent model's best candidate, trusted or not (diagnostics). */
   coherent?: {
     frequency: number;
@@ -112,11 +120,26 @@ export type MeasureResult =
     })
   | (Common & { kind: 'no-clean'; frequency: number })
   | (Common & { kind: 'none' })
-  | (Common & { kind: 'error'; message: string });
+  | (Common & { kind: 'error'; reason: 'too-bright' | 'too-dark' | 'moved' | 'exposure' | 'camera'; message: string });
 
-const TARGET_LUMA = 115;
-const MIN_LUMA = 12;
+/** Calibration target for the mean luma (0-255): leaves headroom for longer exposures. */
+const TARGET_LUMA = 80;
+/** A step is unusable below this mean luma or above this fraction of clipped pixels. */
+const MIN_LUMA = 10;
 const MAX_CLIP = 0.02;
+/**
+ * Usable brightness relative to the target, as exposure factors (luma ~ exposure^(1/2.2)):
+ * 8x brighter is mean luma ~205, 1/16 is ~23. Within this window the analysis works (it
+ * compares log brightness, so a constant gain cancels); beyond it frames clip or drown.
+ */
+const MAX_OVER = 8;
+const MIN_UNDER = 1 / 16;
+const TOO_BRIGHT =
+  "The screen is too bright for this phone camera at the shutter speeds needed. Show a darker grey image on it and try again. (Leave the screen's brightness setting as it will be on set: it can change how the screen flickers.)";
+const TOO_DARK = 'The screen is too dark for this phone camera. Show a lighter grey image on it and try again.';
+/** The sweep must reach at least this long and span at least this ratio to be useful. */
+const MIN_USEFUL_MAX = 1 / 100;
+const MIN_USEFUL_SPAN = 3;
 /** Largest change the refinement may make to the coarse estimate (relative). */
 const MAX_REFINE_MOVE = 0.03;
 /** Minimum explained band variance for the coherent model to be trusted. */
@@ -143,47 +166,119 @@ export async function measure(cam: MeasureCamera, opt: MeasureOptions): Promise<
   const swept: [number, number] = [eMin, sweepMax];
   let fit: FlickerFit | null = null;
   let coherentInfo: Common['coherent'];
-  const common = (): Common => ({ range, swept, steps, skipped: steps.filter((s) => !s.valid).length, fit, coherent: coherentInfo });
+  let calibration: Common['calibration'];
+  let limited: Common['limited'];
+  const common = (): Common => ({
+    range,
+    swept,
+    steps,
+    skipped: steps.filter((s) => s.phase !== 'calibrate' && !s.valid).length,
+    fit,
+    coherent: coherentInfo,
+    calibration,
+    limited,
+  });
   if (!(resultMax > eMin)) {
-    return { ...common(), kind: 'error', message: 'The camera does not support the needed exposure range.' };
+    return { ...common(), kind: 'error', reason: 'camera', message: 'The camera does not support the needed exposure range.' };
   }
 
-  const grid = exposureGrid(eMin, sweepMax, opt.ratio ?? 1.025, cam.exposure.step);
   const refineEstimate = 72;
-  let total = 4 + grid.length + refineEstimate;
+  let total = 8 + 104 + refineEstimate;
   let done = 0;
   const progress = (phase: Progress['phase'], exposure?: number) => opt.onProgress?.({ phase, done, total, exposure });
   const checkAbort = () => {
     if (opt.signal?.aborted) throw new DOMException('Measurement stopped', 'AbortError');
   };
 
-  // ISO calibration: keep exposure x ISO constant so every step has the same brightness.
-  let isoFor: (e: number) => number | undefined = () => undefined;
-  if (cam.iso) {
-    const isoRange = cam.iso;
-    const clampIso = (v: number) => {
-      const c = Math.min(isoRange.max, Math.max(isoRange.min, v));
-      return isoRange.step > 0 ? Math.round(c / isoRange.step) * isoRange.step : c;
-    };
-    const eRef = snapExposure(Math.sqrt(eMin * sweepMax), cam.exposure.step);
-    let iso = clampIso(400);
-    for (let i = 0; i < 4; i++) {
-      checkAbort();
-      progress('calibrate', eRef);
-      await cam.setExposure(eRef, iso);
-      const frames = await cam.capture(discard, 3);
-      done++;
-      const rec = record('calibrate', eRef, iso, frames);
-      steps.push(rec);
-      if (rec.meanLuma > TARGET_LUMA * 0.8 && rec.meanLuma < TARGET_LUMA * 1.25) break;
-      const next = clampIso(iso * Math.min(4, Math.max(0.25, Math.pow(TARGET_LUMA / Math.max(rec.meanLuma, 1), 2.2))));
-      if (next === iso) break;
-      iso = next;
+  // Brightness calibration: find k = exposure x ISO giving the target luma. ISO is
+  // adjusted first; once it hits a limit the exposure moves instead, so a very bright or
+  // dark screen can still be measured over part of the sweep. (Phone cameras have a fixed
+  // aperture and a minimum ISO: a bright screen can be too bright for long exposures.)
+  // Each change is checked against the measured luma: a camera that ignores the ISO is
+  // driven by exposure alone; one whose brightness doesn't follow the exposure either
+  // (still adjusting itself) gets the full sweep, judged step by step on its own luma.
+  const isoRange = cam.iso;
+  const clampIso = (v: number) => {
+    if (!isoRange) return 1;
+    const c = Math.min(isoRange.max, Math.max(isoRange.min, v));
+    return isoRange.step > 0 ? Math.round(c / isoRange.step) * isoRange.step : c;
+  };
+  type Sample = { e: number; iso: number; L: number; clip: number };
+  const usable = (s: Sample) => s.clip <= MAX_CLIP && s.L >= 2 * MIN_LUMA && s.L <= 200;
+  const measurable = (s: Sample) => s.clip <= 0.5 && s.L >= MIN_LUMA && s.L <= 240;
+  let e = snapExposure(Math.sqrt(eMin * sweepMax), cam.exposure.step);
+  let iso = clampIso(isoRange ? Math.sqrt(isoRange.min * isoRange.max) : 1);
+  let isoWorks = isoRange !== undefined;
+  let exposureWorks: boolean | undefined;
+  let prev: Sample | null = null;
+  let closest: Sample | null = null;
+  for (let i = 0; i < 8; i++) {
+    checkAbort();
+    progress('calibrate', e);
+    await cam.setExposure(e, isoRange ? iso : undefined);
+    // Extra frames dropped: a change only counts once it has surely taken effect.
+    const rec = record('calibrate', e, isoRange ? iso : undefined, await cam.capture(discard + 3, 3));
+    done++;
+    steps.push(rec);
+    const cur: Sample = { e, iso, L: Math.max(rec.meanLuma, 1), clip: rec.clipFraction };
+    if (prev && measurable(prev) && measurable(cur)) {
+      const r = (cur.e * cur.iso) / (prev.e * prev.iso);
+      // Luma ~ (exposure x ISO)^(1/2.2); a quarter of that change counts as a response.
+      const responds = Math.log(cur.L / prev.L) / Math.log(r) > 0.25 / 2.2;
+      if (Math.abs(Math.log(r)) >= Math.log(2)) {
+        if (cur.e === prev.e) isoWorks = responds;
+        else if (cur.iso === prev.iso) exposureWorks = responds;
+      }
     }
-    const k = eRef * iso;
-    isoFor = (e) => clampIso(k / e);
+    prev = cur;
+    if (exposureWorks === false) break;
+    const off = (s: Sample) => Math.abs(Math.log(s.L / TARGET_LUMA));
+    if (usable(cur) && (!closest || off(cur) < off(closest))) closest = cur;
+    if (usable(cur) && cur.L > TARGET_LUMA * 0.7 && cur.L < TARGET_LUMA * 1.4) break;
+    const factor = cur.clip > MAX_CLIP ? 1 / 8 : Math.min(16, Math.max(1 / 16, Math.pow(TARGET_LUMA / cur.L, 2.2)));
+    if (isoWorks) {
+      const nextIso = clampIso(iso * factor);
+      if (nextIso !== iso) {
+        iso = nextIso;
+        continue;
+      }
+    }
+    // Calibrated within the sweep: exposures beyond it would also slow the frame rate.
+    const nextE = snapExposure(Math.min(sweepMax, Math.max(eMin, e * factor)), cam.exposure.step);
+    if (nextE === e) break;
+    e = nextE;
   }
+  const controlled = exposureWorks !== false;
+  // Brightness-relevant product: ISO counts only if the camera follows it.
+  const gain = (ex: number, is: number) => ex * (isoWorks ? is : 1);
+  const k = closest ? gain(closest.e, closest.iso) * Math.pow(TARGET_LUMA / closest.L, 2.2) : NaN;
+  calibration = { k: controlled && closest ? k : null, isoControl: isoWorks, exposureControl: exposureWorks ?? null };
+  if (controlled && !closest) {
+    const bright = !!prev && (prev.clip > MAX_CLIP || prev.L > 200);
+    return { ...common(), kind: 'error', reason: bright ? 'too-bright' : 'too-dark', message: bright ? TOO_BRIGHT : TOO_DARK };
+  }
+  const fixedIso = iso;
+  const isoFor = (ex: number) => (!isoRange ? undefined : isoWorks && controlled ? clampIso(k / ex) : fixedIso);
+  // Brightness of a step relative to the target, with ISO clamped to its range.
+  const relative = (ex: number) => gain(ex, isoFor(ex) ?? 1) / k;
+
+  // Sweep only the exposures this camera can capture at a usable brightness.
+  const full = exposureGrid(eMin, sweepMax, opt.ratio ?? 1.025, cam.exposure.step);
+  const grid = controlled ? full.filter((ex) => relative(ex) <= MAX_OVER && relative(ex) >= MIN_UNDER) : full;
+  const lo = grid[0];
+  const hi = grid[grid.length - 1];
+  if (!grid.length || hi < MIN_USEFUL_MAX || hi / lo < MIN_USEFUL_SPAN) {
+    const bright = !grid.length ? relative(eMin) > MAX_OVER : hi < MIN_USEFUL_MAX || relative(full[full.length - 1]) > MAX_OVER;
+    return { ...common(), kind: 'error', reason: bright ? 'too-bright' : 'too-dark', message: bright ? TOO_BRIGHT : TOO_DARK };
+  }
+  swept[0] = lo;
+  swept[1] = hi;
+  if (controlled) limited = { fast: lo > full[0], slow: hi < full[full.length - 1] };
+
   // Align everything to a frame at the mid exposure: moderate bands, low noise.
+  const eAlign = snapExposure(Math.sqrt(lo * hi), cam.exposure.step);
+  await cam.setExposure(eAlign, isoFor(eAlign));
+  await cam.capture(discard, 0);
   cam.resetAlignment?.();
   await cam.capture(0, 1);
   total = done + grid.length + refineEstimate;
@@ -216,9 +311,10 @@ export async function measure(cam: MeasureCamera, opt: MeasureOptions): Promise<
     return {
       ...common(),
       kind: 'error',
+      reason: moved ? 'moved' : 'exposure',
       message: moved
         ? 'The phone moved too much. Rest it against something or hold it very still and try again.'
-        : 'The image was too bright or too dark at most shutter speeds. Lower the screen brightness or move closer.',
+        : 'Most shutter speeds gave an unusable image (too bright or too dark). Show a plain grey image on the screen and try again.',
     };
   }
   progress('analyse');
@@ -290,9 +386,12 @@ export async function measure(cam: MeasureCamera, opt: MeasureOptions): Promise<
     best = closestTo(clean, target) ?? best;
     return { ...common(), kind: 'flicker', frequency, best, clean, refined: false, reference: 'coherent', explained: coherent.explained, confident: true };
   }
-  const n = Math.round(best * frequency);
-  const start = best;
-  let center = best;
+  // Refined at the clean value nearest the target that the sweep could measure: the dip's
+  // relative width is the same at every null, so any of them pins the frequency down.
+  const at = closestTo(cleanExposures(frequency, swept[0], swept[1]), target) ?? best;
+  const n = Math.round(at * frequency);
+  const start = at;
+  let center = at;
   let half = Math.min(0.04, 0.3 / n);
   const maxHalf = 0.4 / n;
   let refined = false;
